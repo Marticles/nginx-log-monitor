@@ -2,11 +2,13 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"github.com/influxdata/influxdb/client/v2"
 	"io"
 	"log"
+	"net/http"
 	"net/url"
 	"os"
 	"regexp"
@@ -49,11 +51,67 @@ type Message struct {
 // 系统状态监控
 type SystemInfo struct {
 	HandleLine   int     `json:"handleLine"`   // 总处理日志行数
-	Tps          float64 `json:"tps"`          // 系统吞出量
+	Tps          float64 `json:"tps"`          // 每秒事务处理量 吞吐量
 	ReadChanLen  int     `json:"readChanLen"`  // read channel 长度
 	WriteChanLen int     `json:"writeChanLen"` // write channel 长度
 	RunTime      string  `json:"runTime"`      // 运行总时间
 	ErrNum       int     `json:"errNum"`       // 错误数
+}
+
+const (
+	// log行数标记
+	TypeHandleLine = 0
+	// 异常数标记
+	TypeErrNum = 1
+)
+
+var TypeMonitorChan = make(chan int, 200)
+
+type Monitor struct {
+	startTime time.Time
+	data      SystemInfo
+	tpsSli    []int
+}
+
+func (m *Monitor) start(lp *LogProcess) {
+
+	go func() {
+		for n := range TypeMonitorChan {
+			switch n {
+			case TypeErrNum:
+				m.data.ErrNum += 1
+			case TypeHandleLine:
+				m.data.HandleLine += 1
+			}
+		}
+	}()
+
+	ticker := time.NewTicker(time.Second * 5)
+
+	go func() {
+		for {
+			<-ticker.C
+			m.tpsSli = append(m.tpsSli, m.data.HandleLine)
+			if len(m.tpsSli) > 2 {
+				m.tpsSli = m.tpsSli[1:]
+			}
+		}
+	}()
+
+	http.HandleFunc("/monitor", func(writer http.ResponseWriter, request *http.Request) {
+		m.data.RunTime = time.Now().Sub(m.startTime).String()
+		m.data.ReadChanLen = len(lp.rc)
+		m.data.WriteChanLen = len(lp.wc)
+
+		if len(m.tpsSli) >= 2 {
+			m.data.Tps = float64(m.tpsSli[1]-m.tpsSli[0]) / 5
+		}
+
+		ret, _ := json.MarshalIndent(m.data, "", "\t")
+		io.WriteString(writer, string(ret))
+	})
+
+	http.ListenAndServe(":9999", nil)
 }
 
 func (r *ReadFromFile) Read(rc chan []byte) {
@@ -80,6 +138,10 @@ func (r *ReadFromFile) Read(rc chan []byte) {
 		} else if err != nil {
 			panic(fmt.Sprint("Read file error:%s", err.Error()))
 		}
+
+		// 读取行数计数
+		TypeMonitorChan <- TypeHandleLine
+
 		// 去掉换行符
 		rc <- line[:len(line)-1]
 	}
@@ -96,6 +158,8 @@ func (l *LogProcess) Process() {
 		ret := r.FindStringSubmatch(string(v))
 		// 正则匹配失败
 		if len(ret) != 14 {
+			// 异常计数
+			TypeMonitorChan <- TypeErrNum
 			log.Println("FindStringSubmatch fail:", string(v))
 			continue
 		}
@@ -103,7 +167,7 @@ func (l *LogProcess) Process() {
 		message := &Message{}
 		t, err := time.ParseInLocation("02/Jan/2006:15:04:05 +0000", ret[4], loc)
 		if err != nil {
-
+			TypeMonitorChan <- TypeErrNum
 			log.Println("ParseInLocation fail:", err.Error(), ret[4])
 			continue
 		}
@@ -115,7 +179,7 @@ func (l *LogProcess) Process() {
 		// GET /foo?query=t HTTP/1.0
 		reqSli := strings.Split(ret[6], " ")
 		if len(reqSli) != 3 {
-
+			TypeMonitorChan <- TypeErrNum
 			log.Println("strings.Split fail", ret[6])
 			continue
 		}
@@ -124,7 +188,7 @@ func (l *LogProcess) Process() {
 		u, err := url.Parse(reqSli[1])
 		if err != nil {
 			log.Println("url parse fail:", err)
-
+			TypeMonitorChan <- TypeErrNum
 			continue
 		}
 		message.Path = u.Path
@@ -143,9 +207,7 @@ func (l *LogProcess) Process() {
 
 func (w *WriteToInfluxDB) Write(wc chan *Message) {
 	// 写入模块
-
-	infSli := strings.Split(w.influxDBDsn,"@")
-
+	infSli := strings.Split(w.influxDBDsn, "@")
 	// Create a new HTTPClient
 	c, err := client.NewHTTPClient(client.HTTPConfig{
 		Addr:     infSli[0],
@@ -156,8 +218,7 @@ func (w *WriteToInfluxDB) Write(wc chan *Message) {
 		log.Fatal(err)
 	}
 
-
-	for v := range wc{
+	for v := range wc {
 
 		// Create a new point batch
 		bp, err := client.NewBatchPoints(client.BatchPointsConfig{
@@ -169,11 +230,11 @@ func (w *WriteToInfluxDB) Write(wc chan *Message) {
 		}
 
 		// Create a point and add to batch
-		tags := map[string]string{"Path": v.Path, "Method":v.Method,"Scheme":v.Scheme,"Status":v.Status}
+		tags := map[string]string{"Path": v.Path, "Method": v.Method, "Scheme": v.Scheme, "Status": v.Status}
 		fields := map[string]interface{}{
-			"UpstreamTime":   v.UpstreamTime,
+			"UpstreamTime":      v.UpstreamTime,
 			"RequeststreamTime": v.RequestTime,
-			"ByteSent":   v.BytesSent,
+			"ByteSent":          v.BytesSent,
 		}
 
 		pt, err := client.NewPoint("nginx_log", tags, fields, v.TimeLocal)
@@ -199,26 +260,36 @@ func (w *WriteToInfluxDB) Write(wc chan *Message) {
 func main() {
 
 	var path, influxDsn string
-	flag.StringVar(&path, "path","./tmp/access.log","read file path")
-	flag.StringVar(&influxDsn, "influxDsn","http://127.0.0.1:8086@root@root@log@s","influx data source")
+	flag.StringVar(&path, "path", "/var/log/nginx/access.log", "read file path")
+	flag.StringVar(&influxDsn, "influxDsn", "http://127.0.0.1:8086@root@root@log@s", "influx data source")
 	flag.Parse()
 
 	r := &ReadFromFile{path,}
 	w := &WriteToInfluxDB{influxDsn,}
 
 	lp := &LogProcess{
-		rc: make(chan []byte),
-		wc: make(chan *Message),
+		rc: make(chan []byte, 200),
+		wc: make(chan *Message, 200),
 
-		//注入
+		// 注入
 		read:  r,
 		write: w,
 	}
 
-	//并发执行
+	// 并发执行
 	go lp.read.Read(lp.rc)
-	go lp.Process()
-	go lp.write.Write(lp.wc)
+	for i := 0;i < 2; i++{
+		go lp.Process()
+	}
 
-	time.Sleep(30 * time.Second)
+	for i := 0;i < 4; i++{
+		go lp.write.Write(lp.wc)
+	}
+
+
+	m := &Monitor{
+		startTime: time.Now(),
+		data:      SystemInfo{},
+	}
+	m.start(lp)
 }

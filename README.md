@@ -1,9 +1,9 @@
 # Nginx-Log-Monitor
 [![MIT Licence](https://badges.frapsoft.com/os/mit/mit.svg?v=103)](https://opensource.org/licenses/mit-license.php)
 ![](https://img.shields.io/badge/language-Go-orange.svg)
-![](img/index.png)
 ![](img/monitor.png)
-A simple monitor to load nginx logs and save to InfluxDB.
+## Introduction
+A simple monitor for analyzing nginx log.
 
 This Project implemented as two separate parts:
 1. Read, clean, process and append the each log to the databse from nginx log file "access.log". This part is implemented in Go.
